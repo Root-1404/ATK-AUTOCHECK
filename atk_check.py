@@ -3,7 +3,7 @@ import os
 import jwt
 import time
 import datetime
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 token = os.getenv("ATK_TOKEN", "")
 if not token:
@@ -68,10 +68,10 @@ def clean_old_screenshots(save_dir="./screenshots", keep_count=1):
             print(f"🧹 删除旧截图: {os.path.basename(path)}")
 
 def take_status_screenshot_by_html(stats_data, profile_data, remain_days, remain_hours, note_text="", save_dir="./screenshots"):
-    clean_old_screenshots(save_dir, keep_count=1)
+    """本地生成状态信息截图"""
     os.makedirs(save_dir, exist_ok=True)
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_file = os.path.join(save_dir, f"atk_checkin_{now_str}.png")
+    save_file = os.path.join(save_dir, f"atk_status_{now_str}.png")
     html_path = os.path.join(save_dir, "temp.html")
 
     d = stats_data.get("data", {})
@@ -91,7 +91,6 @@ def take_status_screenshot_by_html(stats_data, profile_data, remain_days, remain
             .ok {{color:#4cd964;}}
             .no {{color:#ff3b30;}}
             .info {{color:#74b9ff;}}
-            .warn {{color:#ff9500;}}
             .card {{border:1px solid #EEE;border-radius:8px;padding:16px;margin-bottom:20px;background:#222;}}
             .card-title {{font-size:16px;color:#aaa;margin-bottom:8px;}}
             .card-value {{font-size:32px;font-weight:bold;}}
@@ -131,8 +130,49 @@ def take_status_screenshot_by_html(stats_data, profile_data, remain_days, remain
         page.screenshot(path=save_file, full_page=True)
         browser.close()
     os.remove(html_path)
-    print(f"📸 签到状态截图已保存: {save_file}")
+    print(f"📊 状态信息截图已保存: {save_file}")
     return save_file
+
+def take_real_atk_page_screenshot(save_dir="./screenshots"):
+    """【新增】抓取真实ATK官网页面截图，带容错，不会卡死脚本"""
+    os.makedirs(save_dir, exist_ok=True)
+    now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_file = os.path.join(save_dir, f"atk_realpage_{now_str}.png")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"]
+            )
+            context = browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent=headers["User-Agent"]
+            )
+            page = context.new_page()
+            # 1. 先访问官网首页，获取域名上下文
+            page.goto("https://www.atkgear.com.cn", timeout=45000)
+            # 2. 注入登录token到LocalStorage（覆盖常见存储key，适配前端）
+            page.evaluate(f"""() => {{
+                localStorage.setItem('token', '{token}');
+                localStorage.setItem('access_token', '{token}');
+            }}""")
+            # 3. 刷新页面让登录态生效
+            page.reload(timeout=45000)
+            # 4. 等待页面网络空闲，最多45秒，超时不报错
+            try:
+                page.wait_for_load_state("networkidle", timeout=45000)
+            except PlaywrightTimeout:
+                print("⚠️ 页面网络加载超时，强制截图当前状态")
+            # 5. 额外等待5秒让签到弹窗渲染
+            page.wait_for_timeout(5000)
+            # 6. 全页截图
+            page.screenshot(path=save_file, full_page=True)
+            browser.close()
+        print(f"🌐 真实官网页面截图已保存: {save_file}")
+        return save_file
+    except Exception as e:
+        print(f"⚠️ 真实页面截图失败（不影响签到主流程）: {str(e)}")
+        return None
 
 if __name__ == "__main__":
     remain_days, remain_hours = parse_jwt_remain_time(token)
@@ -144,7 +184,7 @@ if __name__ == "__main__":
             if remain_days < 3:
                 print("❗ 警告：Token剩余不足3天，请尽快更换！")
 
-    # ===== 获取签到前状态 =====
+    # 签到前状态
     stats_before = get_checkin_stats()
     profile_before = get_member_profile()
     print("\n📊【签到前】签到统计接口返回：")
@@ -153,16 +193,16 @@ if __name__ == "__main__":
     print(profile_before)
 
     data_before = stats_before.get("data", {})
+    note_text = ""
 
     if data_before.get("isCheckedInToday"):
         print("\nℹ️ 今日已经完成签到，无需重复执行")
-        take_status_screenshot_by_html(stats_before, profile_before, remain_days, remain_hours, note_text="无需签到，今日已签")
+        note_text = "无需签到，今日已签"
     else:
         print("\n🚀 开始执行签到...")
         sign_result = do_checkin()
         print("✅ 签到接口返回结果：")
         print(sign_result)
-        # ===== 签到完成，重新拉取最新状态 =====
         time.sleep(2)
         stats_after = get_checkin_stats()
         profile_after = get_member_profile()
@@ -171,13 +211,22 @@ if __name__ == "__main__":
         print("\n👤【签到后】用户资料接口返回：")
         print(profile_after)
 
-        # 校验签到结果
         data_after = stats_after.get("data", {})
         if data_after.get("isCheckedInToday") is True:
             print("\n✅ 校验通过：签到成功，isCheckedInToday已更新为true")
-            note = "已执行一次签到请求，校验签到成功"
+            note_text = "已执行一次签到请求，校验签到成功"
         else:
             print("\n⚠️⚠️⚠️ 校验告警：已经调用签到接口，但isCheckedInToday仍然为false！可能受UTC时区限制/接口异常！")
-            note = "⚠️校验告警：调用签到后状态未变更，注意UTC时区问题"
+            note_text = "⚠️校验告警：调用签到后状态未变更，注意UTC时区问题"
 
-        take_status_screenshot_by_html(stats_after, profile_after, remain_days, remain_hours, note_text=note)
+    # 清理旧截图（本地状态+真实页面截图都清理）
+    clean_old_screenshots("./screenshots", keep_count=1)
+    # 生成本地状态截图
+    take_status_screenshot_by_html(
+        stats_after if 'stats_after' in dir() else stats_before,
+        profile_after if 'profile_after' in dir() else profile_before,
+        remain_days, remain_hours,
+        note_text=note_text
+    )
+    # 【新增】抓取真实官网页面截图
+    take_real_atk_page_screenshot()
