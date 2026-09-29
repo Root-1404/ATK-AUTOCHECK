@@ -20,6 +20,7 @@ headers = {
 }
 
 def parse_jwt_remain_time(jwt_token: str):
+    """解析JWT剩余有效期"""
     try:
         payload = jwt.decode(jwt_token, options={"verify_signature": False})
         exp_ts = payload.get("exp")
@@ -35,21 +36,25 @@ def parse_jwt_remain_time(jwt_token: str):
         return None, None
 
 def get_checkin_stats():
+    """获取签到统计信息"""
     url = "https://api.vxe.com/v1/member/checkin/stats"
     resp = requests.get(url, headers=headers, timeout=20)
     return resp.json()
 
 def get_member_profile():
+    """获取用户积分信息"""
     url = "https://api.vxe.com/v1/member/profile"
     resp = requests.get(url, headers=headers, timeout=20)
     return resp.json()
 
 def do_checkin():
+    """提交签到请求"""
     url = "https://api.vxe.com/v1/member/checkin"
     resp = requests.post(url, headers=headers, timeout=20)
     return resp.json()
 
 def clean_old_screenshots(save_dir="./screenshots", keep_count=1):
+    """自动清理旧截图，只保留最新1组"""
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
         return
@@ -68,7 +73,7 @@ def clean_old_screenshots(save_dir="./screenshots", keep_count=1):
             print(f"🧹 删除旧截图: {os.path.basename(path)}")
 
 def take_status_screenshot_by_html(stats_data, profile_data, remain_days, remain_hours, note_text="", save_dir="./screenshots"):
-    """本地生成清晰状态卡片截图（不依赖网页加载）"""
+    """本地生成清晰状态卡片截图（不受网页加载影响）"""
     os.makedirs(save_dir, exist_ok=True)
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     save_file = os.path.join(save_dir, f"atk_status_{now_str}.png")
@@ -134,7 +139,7 @@ def take_status_screenshot_by_html(stats_data, profile_data, remain_days, remain
     return save_file
 
 def take_sign_popup_screenshot(save_dir="./screenshots"):
-    """【核心】Playwright定位积分商城签到弹窗，只截弹窗区域"""
+    """修复版：请求拦截注入鉴权，精准截取积分商城签到日历弹窗"""
     os.makedirs(save_dir, exist_ok=True)
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     save_file = os.path.join(save_dir, f"atk_sign_popup_{now_str}.png")
@@ -148,39 +153,38 @@ def take_sign_popup_screenshot(save_dir="./screenshots"):
                 viewport={"width": 1280, "height": 900},
                 user_agent=headers["User-Agent"]
             )
+
+            # 核心修复：拦截所有API请求，强制注入鉴权头，彻底解决跳登录页问题
+            def intercept_request(route):
+                req_headers = route.request.headers
+                if "api.vxe.com" in route.request.url:
+                    req_headers["Authorization"] = f"Bearer {token}"
+                    req_headers["client-type"] = "atk"
+                    req_headers["env"] = "prod"
+                route.continue_(headers=req_headers)
+            context.route("**/*", intercept_request)
+
             page = context.new_page()
-            # 1. 访问积分商城页面（即使路由404，全局签到弹窗组件依然会挂载）
+            # 先访问官网根域名初始化上下文，避免直接访问积分商城被跳登录
+            page.goto("https://www.atkgear.com.cn", timeout=45000)
+            page.wait_for_timeout(2000)
+            # 导航到积分商城页面
             page.goto("https://www.atkgear.com.cn/pointmall/mallcenter", timeout=45000)
-            # 2. 注入登录Token到LocalStorage
-            page.evaluate(f"""() => {{
-                localStorage.setItem('token', '{token}');
-                localStorage.setItem('accessToken', '{token}');
-            }}""")
-            page.reload(timeout=45000)
-            # 3. 优先定位签到弹窗元素（多选择器兜底，提高成功率）
-            popup_selectors = [
-                "div[data-v-a5e1a372].candidate",
-                "div.p-8.bg-white.flex.flex-col.gap-5.mb-\\[40px\\]",
-                "div:has-text('连续签到')",
-                "div:has-text('可用积分')"
-            ]
-            target_el = None
-            for selector in popup_selectors:
-                try:
-                    locator = page.locator(selector).first
-                    locator.wait_for(state="visible", timeout=15000)
-                    target_el = locator
-                    print(f"✅ 定位到签到弹窗元素: {selector}")
-                    break
-                except PlaywrightTimeout:
-                    continue
-            # 4. 截图：优先截弹窗元素，找不到就截首屏兜底
-            if target_el:
-                target_el.screenshot(path=save_file)
-            else:
-                print("⚠️ 未定位到签到弹窗元素，兜底截取页面首屏")
-                page.wait_for_timeout(5000)
+            page.wait_for_load_state("networkidle", timeout=30000)
+
+            # 精准定位签到日历弹窗：匹配带连续签到、日历、签到按钮的模态框
+            popup_locator = page.locator(
+                "div:has-text('连续签到'):has-text('今日已签到'), div:has-text('连续签到'):has-text('积分额外')"
+            ).first
+            try:
+                popup_locator.wait_for(state="visible", timeout=20000)
+                print("✅ 成功定位签到日历弹窗")
+                page.wait_for_timeout(2000)  # 等待弹窗渲染动画完成
+                popup_locator.screenshot(path=save_file)
+            except PlaywrightTimeout:
+                print("⚠️ 未检测到自动弹出的签到弹窗，截取积分商城首屏兜底")
                 page.screenshot(path=save_file, full_page=False)
+
             browser.close()
         print(f"🌐 签到弹窗截图已保存: {save_file}")
         return save_file
@@ -189,6 +193,7 @@ def take_sign_popup_screenshot(save_dir="./screenshots"):
         return None
 
 if __name__ == "__main__":
+    # 1. 打印Token剩余有效期
     remain_days, remain_hours = parse_jwt_remain_time(token)
     if remain_days is not None:
         if remain_days <=0 and remain_hours <=0:
@@ -198,7 +203,7 @@ if __name__ == "__main__":
             if remain_days < 3:
                 print("❗ 警告：Token剩余不足3天，请尽快更换！")
 
-    # 签到前状态查询
+    # 2. 查询签到前状态
     stats_before = get_checkin_stats()
     profile_before = get_member_profile()
     print("\n📊【签到前】签到统计接口返回：")
@@ -215,12 +220,13 @@ if __name__ == "__main__":
         print("\nℹ️ 今日已经完成签到，无需重复执行")
         note_text = "无需签到，今日已签"
     else:
+        # 3. 执行签到
         print("\n🚀 开始执行签到...")
         sign_result = do_checkin()
         print("✅ 签到接口返回结果：")
         print(sign_result)
         time.sleep(2)
-        # 签到后重新拉取最新状态
+        # 4. 签到后重新拉取最新状态，校验是否成功
         stats_final = get_checkin_stats()
         profile_final = get_member_profile()
         print("\n📊【签到后】签到统计接口返回：")
@@ -236,7 +242,7 @@ if __name__ == "__main__":
             print("\n⚠️⚠️⚠️ 校验告警：已经调用签到接口，但isCheckedInToday仍然为false！可能受UTC时区限制/接口异常！")
             note_text = "⚠️校验告警：调用签到后状态未变更，注意UTC时区问题"
 
-    # 清理旧截图，生成两张截图
+    # 5. 清理旧截图，生成两张截图
     clean_old_screenshots("./screenshots", keep_count=1)
     take_status_screenshot_by_html(stats_final, profile_final, remain_days, remain_hours, note_text=note_text)
     take_sign_popup_screenshot()
