@@ -133,64 +133,68 @@ def take_status_screenshot_by_html(stats_data, profile_data, remain_days, remain
     return save_file
 
 def take_sign_popup_screenshot(save_dir="./screenshots"):
-    """修复版：等积分加载完成→点击签到日历按钮→精准截取签到弹窗"""
+    """修复超时版：海外服务器访问国内网站，只等DOM不等待静态资源"""
     os.makedirs(save_dir, exist_ok=True)
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     save_file = os.path.join(save_dir, f"atk_sign_popup_{now_str}.png")
+    page = None
+    browser = None
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox"]
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
             )
             context = browser.new_context(
                 viewport={"width": 1280, "height": 900},
-                user_agent=headers["User-Agent"]
+                user_agent=headers["User-Agent"],
+                locale="zh-CN"
             )
 
-            # 拦截所有API请求，强制注入鉴权头
+            # 拦截API请求，注入鉴权头
             def intercept_request(route):
                 req_headers = route.request.headers
                 if "api.vxe.com" in route.request.url:
                     req_headers["Authorization"] = f"Bearer {token}"
                     req_headers["client-type"] = "atk"
                     req_headers["env"] = "prod"
+                # 阻断不必要的第三方统计、追踪请求，加速页面加载
+                if any(block_url in route.request.url for block_url in ["hm.baidu", "google-analytics", "doubleclick", "cnzz"]):
+                    return route.abort()
                 route.continue_(headers=req_headers)
             context.route("**/*", intercept_request)
 
             page = context.new_page()
-            # 1. 访问积分商城页面
-            page.goto("https://www.atkgear.com.cn/pointmall/mallcenter", timeout=60000)
-            page.wait_for_load_state("networkidle", timeout=40000)
-
-            # 2. 等待可用积分加载完成（不是占位符"-"）
+            # 核心修复：只等DOM结构出现就继续，不等所有图片/静态资源加载
             try:
-                page.wait_for_function(
-                    """() => !document.body.innerText.includes('可用积分 -')""",
-                    timeout=20000
+                page.goto(
+                    "https://www.atkgear.com.cn/pointmall/mallcenter",
+                    wait_until="domcontentloaded",  # 不等待load事件，不等所有资源
+                    timeout=30000
                 )
-                print("✅ 可用积分数据加载完成")
             except PlaywrightTimeout:
-                print("⚠️ 等待积分加载超时，继续操作")
-            page.wait_for_timeout(2000)  # 额外等待渲染
+                print("⚠️ 页面加载超时，DOM已就绪，继续尝试截图")
 
-            # 3. 点击页面上的「签到日历」按钮，触发弹窗
+            # 只等核心交互元素出现，不等网络空闲
+            page.wait_for_timeout(5000)  # 给前端JS5秒时间渲染Vue组件
+
+            # 尝试点击签到日历按钮
             try:
                 sign_calendar_btn = page.locator("div:has-text('签到日历'):visible").first
-                sign_calendar_btn.click(timeout=10000)
+                sign_calendar_btn.click(timeout=8000)
                 print("✅ 成功点击签到日历按钮")
+                page.wait_for_timeout(3000)  # 等弹窗弹出动画
             except Exception as e:
-                print(f"⚠️ 未找到签到日历按钮: {str(e)}")
+                print(f"ℹ️ 未找到签到日历按钮: {str(e)}")
 
-            # 4. 等待签到弹窗出现（你提供的精确DOM：带data-v-22e9525c的白色弹窗）
+            # 尝试定位签到弹窗，找不到就截当前页面
             try:
                 popup_locator = page.locator("div[data-v-22e9525c].relative.bg-white.shadow-lg").first
-                popup_locator.wait_for(state="visible", timeout=15000)
-                page.wait_for_timeout(2000)  # 等弹窗动画结束
-                print("✅ 成功定位签到日历弹窗")
+                popup_locator.wait_for(state="visible", timeout=10000)
                 popup_locator.screenshot(path=save_file)
+                print("✅ 成功截取签到日历弹窗")
             except PlaywrightTimeout:
-                print("⚠️ 签到弹窗未出现，截取积分商城首屏兜底")
+                print("⚠️ 弹窗未加载，截取当前页面兜底")
                 page.screenshot(path=save_file, full_page=False)
 
             browser.close()
@@ -198,6 +202,12 @@ def take_sign_popup_screenshot(save_dir="./screenshots"):
         return save_file
     except Exception as e:
         print(f"⚠️ 签到弹窗截图失败（不影响签到主流程）: {str(e)}")
+        # 清理残留浏览器进程，避免影响后续步骤
+        if browser:
+            try:
+                browser.close()
+            except:
+                pass
         return None
 
 if __name__ == "__main__":
