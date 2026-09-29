@@ -1,6 +1,7 @@
-name: ATK Gear 每日签到
+name: ATK-Gear 每日签到
 on:
   schedule:
+    # UTC 23,0,1,2 → 北京时间7-10点窗口启动Job
     - cron: '0 23,0,1,2 * * *'
   workflow_dispatch:
 
@@ -8,7 +9,7 @@ jobs:
   checkin:
     runs-on: ubuntu-latest
     steps:
-      - name: 拉取脚本
+      - name: 拉取代码
         uses: actions/checkout@v4
 
       - name: 设置Python 3.11
@@ -16,23 +17,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 生成随机等待秒数(0‑14400秒，最大4小时)
+      # 【已修复】纯bash生成随机等待，彻底解决之前python -c的SyntaxError报错
+      - name: 定时任务生成随机等待秒数(0-14400秒，最大4小时)
         if: github.event_name == 'schedule'
         id: random_wait
         run: |
           t=$(( RANDOM % 14400 ))
           echo "wait_seconds=$t" >> $GITHUB_OUTPUT
+          echo "本次定时任务随机等待: $t 秒"
 
-      - name: 随机延时sleep
+      - name: 随机延时sleep（仅定时调度生效）
         if: github.event_name == 'schedule'
         run: sleep ${{ steps.random_wait.outputs.wait_seconds }}
         shell: bash
-        
-      - name: 安装python依赖
+
+      - name: 安装Python依赖
         run: |
           pip install requests pyjwt playwright
 
-      - name: 安装playwright chromium系统依赖
+      - name: 安装Playwright Chromium浏览器及系统依赖
         run: |
           playwright install chromium
           playwright install-deps chromium
@@ -42,8 +45,9 @@ jobs:
           ATK_TOKEN: ${{ secrets.ATK_TOKEN }}
         run: python atk_check.py
 
-      - name: 上传签到截图
+      - name: 上传截图到Artifacts（可在Action页面下载）
         uses: actions/upload-artifact@v4
         with:
-          name: atk-screenshot
+          name: atk-checkin-screenshot
           path: ./screenshots/*.png
+          retention-days: 90
