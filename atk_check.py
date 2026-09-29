@@ -68,7 +68,7 @@ def clean_old_screenshots(save_dir="./screenshots", keep_count=1):
             print(f"🧹 删除旧截图: {os.path.basename(path)}")
 
 def take_status_screenshot_by_html(stats_data, profile_data, remain_days, remain_hours, note_text="", save_dir="./screenshots"):
-    """本地生成状态信息截图"""
+    """本地生成清晰状态卡片截图（不依赖网页加载）"""
     os.makedirs(save_dir, exist_ok=True)
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     save_file = os.path.join(save_dir, f"atk_status_{now_str}.png")
@@ -130,14 +130,14 @@ def take_status_screenshot_by_html(stats_data, profile_data, remain_days, remain
         page.screenshot(path=save_file, full_page=True)
         browser.close()
     os.remove(html_path)
-    print(f"📊 状态信息截图已保存: {save_file}")
+    print(f"📊 状态卡片截图已保存: {save_file}")
     return save_file
 
-def take_real_atk_page_screenshot(save_dir="./screenshots"):
-    """【新增】抓取真实ATK官网页面截图，带容错，不会卡死脚本"""
+def take_sign_popup_screenshot(save_dir="./screenshots"):
+    """【核心】Playwright定位积分商城签到弹窗，只截弹窗区域"""
     os.makedirs(save_dir, exist_ok=True)
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_file = os.path.join(save_dir, f"atk_realpage_{now_str}.png")
+    save_file = os.path.join(save_dir, f"atk_sign_popup_{now_str}.png")
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -145,33 +145,47 @@ def take_real_atk_page_screenshot(save_dir="./screenshots"):
                 args=["--no-sandbox", "--disable-setuid-sandbox"]
             )
             context = browser.new_context(
-                viewport={"width": 1920, "height": 1080},
+                viewport={"width": 1280, "height": 900},
                 user_agent=headers["User-Agent"]
             )
             page = context.new_page()
-            # 1. 先访问官网首页，获取域名上下文
-            page.goto("https://www.atkgear.com.cn", timeout=45000)
-            # 2. 注入登录token到LocalStorage（覆盖常见存储key，适配前端）
+            # 1. 访问积分商城页面（即使路由404，全局签到弹窗组件依然会挂载）
+            page.goto("https://www.atkgear.com.cn/pointmall/mallcenter", timeout=45000)
+            # 2. 注入登录Token到LocalStorage
             page.evaluate(f"""() => {{
                 localStorage.setItem('token', '{token}');
-                localStorage.setItem('access_token', '{token}');
+                localStorage.setItem('accessToken', '{token}');
             }}""")
-            # 3. 刷新页面让登录态生效
             page.reload(timeout=45000)
-            # 4. 等待页面网络空闲，最多45秒，超时不报错
-            try:
-                page.wait_for_load_state("networkidle", timeout=45000)
-            except PlaywrightTimeout:
-                print("⚠️ 页面网络加载超时，强制截图当前状态")
-            # 5. 额外等待5秒让签到弹窗渲染
-            page.wait_for_timeout(5000)
-            # 6. 全页截图
-            page.screenshot(path=save_file, full_page=True)
+            # 3. 优先定位签到弹窗元素（多选择器兜底，提高成功率）
+            popup_selectors = [
+                "div[data-v-a5e1a372].candidate",
+                "div.p-8.bg-white.flex.flex-col.gap-5.mb-\\[40px\\]",
+                "div:has-text('连续签到')",
+                "div:has-text('可用积分')"
+            ]
+            target_el = None
+            for selector in popup_selectors:
+                try:
+                    locator = page.locator(selector).first
+                    locator.wait_for(state="visible", timeout=15000)
+                    target_el = locator
+                    print(f"✅ 定位到签到弹窗元素: {selector}")
+                    break
+                except PlaywrightTimeout:
+                    continue
+            # 4. 截图：优先截弹窗元素，找不到就截首屏兜底
+            if target_el:
+                target_el.screenshot(path=save_file)
+            else:
+                print("⚠️ 未定位到签到弹窗元素，兜底截取页面首屏")
+                page.wait_for_timeout(5000)
+                page.screenshot(path=save_file, full_page=False)
             browser.close()
-        print(f"🌐 真实官网页面截图已保存: {save_file}")
+        print(f"🌐 签到弹窗截图已保存: {save_file}")
         return save_file
     except Exception as e:
-        print(f"⚠️ 真实页面截图失败（不影响签到主流程）: {str(e)}")
+        print(f"⚠️ 签到弹窗截图失败（不影响签到主流程）: {str(e)}")
         return None
 
 if __name__ == "__main__":
@@ -184,7 +198,7 @@ if __name__ == "__main__":
             if remain_days < 3:
                 print("❗ 警告：Token剩余不足3天，请尽快更换！")
 
-    # 签到前状态
+    # 签到前状态查询
     stats_before = get_checkin_stats()
     profile_before = get_member_profile()
     print("\n📊【签到前】签到统计接口返回：")
@@ -194,6 +208,8 @@ if __name__ == "__main__":
 
     data_before = stats_before.get("data", {})
     note_text = ""
+    stats_final = stats_before
+    profile_final = profile_before
 
     if data_before.get("isCheckedInToday"):
         print("\nℹ️ 今日已经完成签到，无需重复执行")
@@ -204,14 +220,15 @@ if __name__ == "__main__":
         print("✅ 签到接口返回结果：")
         print(sign_result)
         time.sleep(2)
-        stats_after = get_checkin_stats()
-        profile_after = get_member_profile()
+        # 签到后重新拉取最新状态
+        stats_final = get_checkin_stats()
+        profile_final = get_member_profile()
         print("\n📊【签到后】签到统计接口返回：")
-        print(stats_after)
+        print(stats_final)
         print("\n👤【签到后】用户资料接口返回：")
-        print(profile_after)
+        print(profile_final)
 
-        data_after = stats_after.get("data", {})
+        data_after = stats_final.get("data", {})
         if data_after.get("isCheckedInToday") is True:
             print("\n✅ 校验通过：签到成功，isCheckedInToday已更新为true")
             note_text = "已执行一次签到请求，校验签到成功"
@@ -219,14 +236,7 @@ if __name__ == "__main__":
             print("\n⚠️⚠️⚠️ 校验告警：已经调用签到接口，但isCheckedInToday仍然为false！可能受UTC时区限制/接口异常！")
             note_text = "⚠️校验告警：调用签到后状态未变更，注意UTC时区问题"
 
-    # 清理旧截图（本地状态+真实页面截图都清理）
+    # 清理旧截图，生成两张截图
     clean_old_screenshots("./screenshots", keep_count=1)
-    # 生成本地状态截图
-    take_status_screenshot_by_html(
-        stats_after if 'stats_after' in dir() else stats_before,
-        profile_after if 'profile_after' in dir() else profile_before,
-        remain_days, remain_hours,
-        note_text=note_text
-    )
-    # 【新增】抓取真实官网页面截图
-    take_real_atk_page_screenshot()
+    take_status_screenshot_by_html(stats_final, profile_final, remain_days, remain_hours, note_text=note_text)
+    take_sign_popup_screenshot()
