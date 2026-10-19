@@ -17,8 +17,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 【已修复】纯bash生成随机等待，彻底解决之前python -c的SyntaxError报错
-      - name: 定时任务生成随机等待秒数(0-14400秒，最大4小时)
+      # 定时任务纯bash随机等待，手动触发跳过
+      - name: 定时任务生成随机等待秒数(0-14400秒)
         if: github.event_name == 'schedule'
         id: random_wait
         run: |
@@ -35,17 +35,23 @@ jobs:
         run: |
           pip install requests pyjwt playwright
 
-      - name: 安装Playwright Chromium浏览器及系统依赖
+      - name: 安装Playwright Chromium浏览器
         run: |
           playwright install chromium
           playwright install-deps chromium
 
       - name: 运行签到脚本
         env:
+          # 原有Token配置
           ATK_TOKEN: ${{ secrets.ATK_TOKEN }}
+          # 邮件预警配置（QQ邮箱默认）
+          SMTP_SERVER: smtp.qq.com
+          SMTP_SENDER: ${{ secrets.SMTP_SENDER }}
+          SMTP_AUTH_CODE: ${{ secrets.SMTP_AUTH_CODE }}
+          SMTP_RECEIVER: ${{ secrets.SMTP_RECEIVER }}
         run: python atk_check.py
 
-      - name: 上传截图到Artifacts（可在Action页面下载）
+      - name: 上传签到截图到Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: atk-checkin-screenshot
